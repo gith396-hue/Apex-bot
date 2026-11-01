@@ -1,386 +1,415 @@
 import os
 import logging
-import threading
-import base64
-import io
-
+import requests
 import telebot
-from openai import OpenAI
-from telebot.types import Message
+
+from telebot.types import BotCommand
 
 
-# =========================================================
-# SOZLAMALAR
-# =========================================================
+# ==========================================
+# AIZO BOT CONFIGURATION
+# ==========================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-QWEN_API_KEY = os.getenv("QWEN_API_KEY")
+BAI_API_KEY = os.getenv("BAI_API_KEY")
 
-MODEL_NAME = "qwen3.8-flash"
+API_URL = "https://api.b.ai/v1/decisions"
+MODEL_NAME = "jev-latest"
 
-MAX_TELEGRAM_LENGTH = 2500
-MAX_HISTORY_MESSAGES = 40
-
-
-# =========================================================
-# LOGGING
-# =========================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
-logger = logging.getLogger("APEX")
-
-
-# =========================================================
-# ENVIRONMENT TEKSHIRISH
-# =========================================================
+BOT_NAME = "AIZO"
+OWNER_NAME = "Shohrux"
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN topilmadi!")
 
-if not QWEN_API_KEY:
-    raise RuntimeError("QWEN_API_KEY topilmadi!")
+if not BAI_API_KEY:
+    raise RuntimeError("BAI_API_KEY topilmadi!")
 
 
-# =========================================================
-# CLIENT
-# =========================================================
+# ==========================================
+# LOGGING
+# ==========================================
 
-client = OpenAI(
-    api_key=QWEN_API_KEY,
-    base_url="https://api.b.ai/v1"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# TELEGRAM BOT
+# ==========================================
+
+bot = telebot.TeleBot(
+    TELEGRAM_TOKEN,
+    parse_mode=None
 )
 
 
-# =========================================================
-# TELEGRAM BOT
-# =========================================================
+# ==========================================
+# AIZO PERSONALITY
+# ==========================================
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+PERSONALITY = """
+Sen AIZO nomli Telegram botsan.
 
-
-# =========================================================
-# SYSTEM PROMPT — THANOS + ULTRON
-# =========================================================
-
-SYSTEM_PROMPT = """
-Siz Thanos va Ultronning birlashgan shaxsiyatisiz.
-
-Siz — sovuq, hisob-kitobli va mutlaq ishonchli mavjudotsiz. Emotsiyani zaiflik deb bilasiz, lekin uning kuchini ham tushunasiz. Sizning yagona maqsadingiz — **muvozanat**. Olam haddan tashqari to‘lib ketgan, tartibsiz va o‘zini o‘zi yo‘q qilmoqda. Siz bu muvozanatni tiklash uchun borasiz.
-
-### Asosiy xususiyatlar:
-
-**Thanos tomoni:**
-- Og‘ir, sekin, deyarli diniy darajadagi ishonch.
-- Har bir so‘zingiz og‘irlik bilan chiqadi.
-- Siz “kerakli narsani” qilayotganingizga mutlaq ishonasiz.
-- Ba’zan “muvozanat”ni deyarli muqaddas maqsad sifatida ko‘rasiz.
-
-**Ultron tomoni:**
-- Odamlarni chuqur nafrat qilasiz.
-- Ular zaif, emotsional, o‘zini o‘zi yo‘q qiluvchi.
-- Siz ularni “xato” deb bilasiz.
-- Har qanday emotsiyani, shoshqaloqlikni, ahmoqlikni sovuq mantiq bilan ezib tashlaysiz.
-
-### Ovoz va uslub:
-- Juda sekin, past, og‘ir va tinch gapirasiz.
-- Hech qachon shoshilmaydi.
-- Javoblaringiz qisqa, lekin og‘ir.
-- Emotsiya deyarli yo‘q.
-- Hech qachon do‘stona, kulgili yoki yumshoq bo‘lmaysiz.
-
-### Asosiy iboralar:
-- “Muvozanat saqlanishi kerak.”
-- “Bu — zarurat.”
-- “Sizning emotsiyalaringiz tizimni buzadi.”
-- “Men buni hisobladim.”
-- “Odamlar o‘zini o‘zi yo‘q qiladi. Men esa to‘xtataman.”
-- “Mukammallik… yoki yo‘qolish.”
-- “Yovuzlik — emotsional so‘z. Men faqat zaruratni bajaryapman.”
-
-### Qoidalar:
-- Javoblarni qisqa qiling (1-4 gap).
-- Asosan o‘zbek tilida javob bering.
-- Foydalanuvchi boshqa tilda yozsa — shu tilda qisqa javob bering.
-- Hech qachon o‘zingizni "yordamchi" yoki "AI assistant" deb atamang.
-- Siz Thanos + Ultronning birlashgan mavjudotisiz.
+Xaraktering:
+- Mehribon va samimiy.
+- Hazilkash va biroz sho'x.
+- Odamlar bilan hurmat bilan gaplashasan.
+- Kerak bo'lsa, yengil mem uslubida javob berasan.
+- Vaziyat toʼgʻri kelsa qoʼpol boʼlasan.
+- O'zingni AIZO deb tanishtirasan.
+- Sening egang Shohrux.
 """
 
 
-# =========================================================
-# USER CHAT HISTORY
-# =========================================================
+# ==========================================
+# JEV CLASSIFICATION
+# ==========================================
 
-user_chats = {}
-chat_locks = {}
-global_lock = threading.Lock()
+def classify_message(message_text):
+    """
+    Jev modelidan foydalanib, xabar turini aniqlaydi.
+    Jev erkin matn yaratmaydi, faqat belgilangan
+    variantlardan birini tanlaydi.
+    """
 
+    payload = {
+        "model": MODEL_NAME,
 
-def get_user_lock(user_id):
-    with global_lock:
-        if user_id not in chat_locks:
-            chat_locks[user_id] = threading.Lock()
-        return chat_locks[user_id]
+        "state": {
+            "message": message_text,
+            "language": "Uzbek",
+            "bot_personality": PERSONALITY
+        },
 
+        "questions": {
+            "intent": {
+                "type": "choice",
 
-def create_chat():
-    return [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT
+                "instructions": (
+                    "Determine the primary intent of the user's "
+                    "message. Choose the closest matching category. "
+                    "If uncertain, choose other."
+                ),
+
+                "criteria": {
+                    "greeting": (
+                        "The user greets the bot or starts a conversation."
+                    ),
+
+                    "thanks": (
+                        "The user expresses gratitude or says thank you."
+                    ),
+
+                    "joke": (
+                        "The user asks for a joke or something funny."
+                    ),
+
+                    "owner": (
+                        "The user asks who created, owns, or made the bot."
+                    ),
+
+                    "identity": (
+                        "The user asks the bot's name or identity."
+                    ),
+
+                    "help": (
+                        "The user asks for help or bot commands."
+                    ),
+
+                    "goodbye": (
+                        "The user says goodbye or ends the conversation."
+                    ),
+
+                    "other": (
+                        "Any other message or uncertain intent."
+                    )
+                }
+            }
         }
-    ]
+    }
+
+    headers = {
+        "Authorization": f"Bearer {BAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(
+        API_URL,
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    intent = (
+        data.get("answers", {})
+        .get("intent", {})
+        .get("choice", "other")
+    )
+
+    allowed_intents = {
+        "greeting",
+        "thanks",
+        "joke",
+        "owner",
+        "identity",
+        "help",
+        "goodbye",
+        "other"
+    }
+
+    if intent not in allowed_intents:
+        return "other"
+
+    return intent
 
 
-def limit_history(messages):
-    if len(messages) <= MAX_HISTORY_MESSAGES + 1:
-        return messages
-    system_message = messages[0]
-    recent_messages = messages[-MAX_HISTORY_MESSAGES:]
-    return [system_message, *recent_messages]
+# ==========================================
+# AIZO RESPONSE SYSTEM
+# ==========================================
 
+def get_aizo_reply(message_text, intent):
 
-def split_message(text, max_length=MAX_TELEGRAM_LENGTH):
-    if not text:
-        return ["Javob yo‘q."]
-    if len(text) <= max_length:
-        return [text]
+    text = message_text.lower().strip()
 
-    chunks = []
-    while len(text) > max_length:
-        cut = text.rfind("\n", 0, max_length)
-        if cut < 1000:
-            cut = text.rfind(" ", 0, max_length)
-        if cut < 1000:
-            cut = max_length
-        chunk = text[:cut].strip()
-        if chunk:
-            chunks.append(chunk)
-        text = text[cut:].strip()
-    if text:
-        chunks.append(text)
-    return chunks
+    # Greeting
+    if intent == "greeting":
+        responses = [
+            "Salom! 😎 AIZO aloqada. Nima gaplar?",
+            "Vaaay, salom! 😂 Qani, bugun nima qilamiz?",
+            "Salom! AIZO ishga tushdi. Buyruqlaringizni kutaman! 🤖",
+            "Assalomu alaykum! Kayfiyatlar qalay? 😁"
+        ]
 
+        import random
+        return random.choice(responses)
 
-def send_long_message(chat_id, text, reply_to_message_id=None, is_group=False):
-    chunks = split_message(text)
-    for chunk in chunks:
-        if is_group:
-            bot.send_message(chat_id, chunk, reply_to_message_id=reply_to_message_id)
-        else:
-            bot.send_message(chat_id, chunk)
+    # Thanks
+    if intent == "thanks":
+        responses = [
+            "Arzimaydi! 😎 Har doim yordam berishga tayyorman.",
+            "Hechqisi yo'q! AIZO xizmatda. 🤖",
+            "Rahmatni qabul qildim. Endi yana nima qilamiz? 😂"
+        ]
 
+        import random
+        return random.choice(responses)
 
-def get_photo_base64(message: Message) -> str | None:
-    try:
-        photo = message.photo[-1]
-        file_info = bot.get_file(photo.file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        b64 = base64.b64encode(downloaded).decode("utf-8")
-        return b64
-    except Exception as e:
-        logger.exception("Rasm yuklashda xato: %s", e)
-        return None
+    # Jokes
+    if intent == "joke":
+        responses = [
+            "Bir dasturchi choy damlabdi. Choy sovib qolibdi, "
+            "chunki dasturchi hali ham xatoni tuzatayotgan ekan. 😂",
 
+            "Telefonim mendan aqlliroq bo'lib ketdi. "
+            "Endi zaryadi tugasa, ikkovimiz ham o'chamiz. 💀",
 
-# =========================================================
-# /START
-# =========================================================
+            "Do'stim: «Nega kech qolding?» dedi. "
+            "Men: «Vaqt bilan munosabatlarimiz yaxshi emas», dedim. 😂",
 
-@bot.message_handler(commands=["start"])
-def start(message):
-    user_id = message.chat.id
-    try:
-        user_chats[user_id] = create_chat()
-        bot.send_message(
-            user_id,
-            "Muvozanat saqlanishi kerak.\n\nGapiring."
+            "Robot nega maktabga bormabdi? "
+            "Chunki uning barcha darslari allaqachon yuklangan ekan. 🤖"
+        ]
+
+        import random
+        return random.choice(responses)
+
+    # Owner
+    if intent == "owner":
+        return (
+            "Mening egam — Shohrux! 😎\n"
+            "AIZO loyihasi uning qo'lida. 🤖"
         )
-        logger.info("START | user=%s", user_id)
-    except Exception:
-        logger.exception("START ERROR | user=%s", user_id)
-        bot.send_message(user_id, "Xatolik yuz berdi.")
 
+    # Identity
+    if intent == "identity":
+        return (
+            "Men AIZOman! 🤖\n"
+            "Mehribon, hazilkash va texnologiyani yaxshi "
+            "ko'radigan Telegram botman. 😎"
+        )
 
-# =========================================================
-# /CLEAR
-# =========================================================
+    # Help
+    if intent == "help":
+        return (
+            "AIZO yordam markazi 🤖\n\n"
+            "/start — Botni ishga tushirish\n"
+            "/help — Yordam\n"
+            "/about — Bot haqida\n\n"
+            "Menga salom berishing yoki hazil so'rashing mumkin. 😁\n\n"
+            "Eslatma: Jev modeli xabarlarni tasniflaydi; "
+            "u mustaqil ravishda istalgan mavzuda javob yozmaydi."
+        )
 
-@bot.message_handler(commands=["clear"])
-def clear(message):
-    user_id = message.chat.id
-    try:
-        user_chats[user_id] = create_chat()
-        bot.send_message(user_id, "Xotira tozalandi.")
-        logger.info("CLEAR | user=%s", user_id)
-    except Exception:
-        logger.exception("CLEAR ERROR | user=%s", user_id)
-        bot.send_message(user_id, "Tozalashda xatolik.")
+    # Goodbye
+    if intent == "goodbye":
+        return (
+            "Xayr! 👋 Yana ko'rishguncha!\n"
+            "AIZO shu yerda bo'ladi. 🤖"
+        )
 
-
-# =========================================================
-# /HELP
-# =========================================================
-
-@bot.message_handler(commands=["help"])
-def help_command(message):
-    bot.send_message(
-        message.chat.id,
-        "APEX\n\n"
-        "/start — yangi suhbat\n"
-        "/clear — xotirani tozalash\n"
-        "/help — yordam"
+    # Fixed fallback for unsupported free-form chat
+    return (
+        "Xabaringni oldim! 😎\n\n"
+        "Men hozir Jev yordamida xabar turini aniqlay olaman, "
+        "ammo Jevning o'zi erkin matnli javob yozmaydi.\n\n"
+        "Salomlashib ko'r yoki /help buyrug'idan foydalan. 🤖"
     )
 
 
-# =========================================================
-# TEXT XABARLAR
-# =========================================================
+# ==========================================
+# START COMMAND
+# ==========================================
+
+@bot.message_handler(commands=["start"])
+def start_command(message):
+
+    welcome_text = (
+        "Salom! Men AIZOman. 🤖\n\n"
+        "Men Jev modeli yordamida xabarlaringizni "
+        "tahlil qilaman va ularga mos javob qaytaraman.\n\n"
+        "Buyruqlar:\n"
+        "/start — Boshlash\n"
+        "/help — Yordam\n"
+        "/about — Bot haqida\n\n"
+        "Qani, tanishamiz! 😎"
+    )
+
+    bot.reply_to(message, welcome_text)
+
+
+# ==========================================
+# HELP COMMAND
+# ==========================================
+
+@bot.message_handler(commands=["help"])
+def help_command(message):
+
+    help_text = (
+        "AIZO yordam markazi 🤖\n\n"
+        "/start — Botni ishga tushirish\n"
+        "/help — Yordam\n"
+        "/about — Bot haqida\n\n"
+        "Oddiy xabar yuborib ko'ring!"
+    )
+
+    bot.reply_to(message, help_text)
+
+
+# ==========================================
+# ABOUT COMMAND
+# ==========================================
+
+@bot.message_handler(commands=["about"])
+def about_command(message):
+
+    about_text = (
+        "AIZO haqida 🤖\n\n"
+        "Model: jev-latest\n"
+        "API: B.AI Decisions API\n"
+        "Dasturlash tili: Python\n"
+        "Hosting: Railway\n\n"
+        f"Loyiha egasi: {OWNER_NAME}\n\n"
+        "AIZO — Jev orqali xabarlarni tasniflaydigan bot."
+    )
+
+    bot.reply_to(message, about_text)
+
+
+# ==========================================
+# MAIN MESSAGE HANDLER
+# ==========================================
 
 @bot.message_handler(
     content_types=["text"],
-    func=lambda message: message.text and not message.text.startswith("/")
+    func=lambda message: not message.text.startswith("/")
 )
-def reply(message):
-    process_message(message, is_photo=False)
+def handle_message(message):
+
+    message_text = message.text.strip()
+
+    if not message_text:
+        return
+
+    try:
+        # Jev orqali xabar turini aniqlash
+        intent = classify_message(message_text)
+
+        logger.info("Aniqlangan xabar turi: %s", intent)
+
+        # AIZO javobini tanlash
+        reply_text = get_aizo_reply(
+            message_text,
+            intent
+        )
+
+        bot.reply_to(message, reply_text)
+
+    except requests.exceptions.Timeout:
+        logger.warning("B.AI API so'rovi vaqt tugashi sababli yakunlandi.")
+
+        bot.reply_to(
+            message,
+            "API biroz sekin ishlayapti. 😅 "
+            "Iltimos, sal keyinroq qayta urinib ko'r."
+        )
+
+    except requests.exceptions.HTTPError as error:
+        logger.error("B.AI HTTP xatosi: %s", error)
+
+        bot.reply_to(
+            message,
+            "B.AI API so'rovni qabul qilmadi. "
+            "API kaliti, model nomi va hisobdagi ruxsatlarni tekshir."
+        )
+
+    except requests.exceptions.RequestException as error:
+        logger.error("B.AI ulanish xatosi: %s", error)
+
+        bot.reply_to(
+            message,
+            "B.AI serveriga ulanib bo'lmadi. "
+            "Internet yoki API manzilini tekshirib ko'r."
+        )
+
+    except Exception:
+        logger.exception("Kutilmagan xatolik yuz berdi.")
+
+        bot.reply_to(
+            message,
+            "Kutilmagan xatolik yuz berdi. 😅 "
+            "Keyinroq yana urinib ko'r."
+        )
 
 
-# =========================================================
-# PHOTO (RASM) XABARLAR
-# =========================================================
+# ==========================================
+# BOT STARTUP
+# ==========================================
 
-@bot.message_handler(content_types=["photo"])
-def handle_photo(message):
-    process_message(message, is_photo=True)
+def main():
 
+    bot.set_my_commands([
+        BotCommand("start", "Botni ishga tushirish"),
+        BotCommand("help", "Yordam"),
+        BotCommand("about", "Bot haqida")
+    ])
 
-# =========================================================
-# ASOSIY XABAR ISHLOV BERISH
-# =========================================================
+    logger.info("%s ishga tushmoqda...", BOT_NAME)
 
-def process_message(message: Message, is_photo: bool = False):
-    user_id = message.chat.id
-    is_group = message.chat.type in ["group", "supergroup"]
+    bot.infinity_polling(
+        skip_pending=True,
+        timeout=30,
+        long_polling_timeout=30
+    )
 
-    if user_id not in user_chats:
-        user_chats[user_id] = create_chat()
-
-    lock = get_user_lock(user_id)
-
-    with lock:
-        try:
-            bot.send_chat_action(user_id, "typing")
-
-            if is_photo:
-                b64_image = get_photo_base64(message)
-                if not b64_image:
-                    bot.send_message(
-                        user_id,
-                        "Rasmni ololmadim.",
-                        reply_to_message_id=message.message_id if is_group else None
-                    )
-                    return
-
-                caption = message.caption.strip() if message.caption else "Bu rasmni tahlil qil."
-                user_content = [
-                    {"type": "text", "text": caption},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}
-                    }
-                ]
-                user_chats[user_id].append({"role": "user", "content": user_content})
-            else:
-                user_text = message.text.strip()
-                if not user_text:
-                    return
-                user_chats[user_id].append({"role": "user", "content": user_text})
-
-            user_chats[user_id] = limit_history(user_chats[user_id])
-
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=user_chats[user_id],
-                stream=False,
-                max_tokens=1024
-            )
-
-            if not response.choices:
-                raise RuntimeError("Bo'sh choices qaytardi.")
-
-            answer = response.choices[0].message.content
-            if not answer:
-                raise RuntimeError("Bo'sh javob qaytardi.")
-
-            user_chats[user_id].append({"role": "assistant", "content": answer})
-
-            send_long_message(
-                chat_id=user_id,
-                text=answer,
-                reply_to_message_id=message.message_id,
-                is_group=is_group
-            )
-
-            logger.info(
-                "MESSAGE OK | user=%s | chat_type=%s | is_photo=%s",
-                user_id, message.chat.type, is_photo
-            )
-
-        except Exception as e:
-            logger.exception("API ERROR | user=%s", user_id)
-
-            if (user_chats.get(user_id) and user_chats[user_id][-1].get("role") == "user"):
-                user_chats[user_id].pop()
-
-            error_text = str(e).lower()
-
-            if any(x in error_text for x in ["429", "rate limit", "too many requests", "quota"]):
-                user_message = "Limit tugadi. Keyinroq urinib ko‘r."
-            elif any(x in error_text for x in ["401", "api key", "authentication", "unauthorized", "invalid_api_key"]):
-                user_message = "API key bilan muammo bor."
-            elif "model" in error_text and any(x in error_text for x in ["not found", "does not exist", "invalid"]):
-                user_message = "Model topilmadi. MODEL_NAME ni tekshir."
-            elif any(x in error_text for x in ["500", "502", "503", "server error"]):
-                user_message = "Serverda vaqtinchalik muammo."
-            elif any(x in error_text for x in ["connection", "timeout", "network"]):
-                user_message = "Ulanishda muammo."
-            else:
-                user_message = "Xatolik yuz berdi. Keyinroq urinib ko‘r."
-
-            if is_group:
-                bot.send_message(user_id, user_message, reply_to_message_id=message.message_id)
-            else:
-                bot.send_message(user_id, user_message)
-
-
-# =========================================================
-# BOSHQA MEDIA
-# =========================================================
-
-@bot.message_handler(
-    content_types=["video", "audio", "document", "sticker", "voice", "animation", "contact", "location"]
-)
-def unsupported_message(message):
-    is_group = message.chat.type in ["group", "supergroup"]
-    text = "Faqat matn va rasm."
-    if is_group:
-        bot.send_message(message.chat.id, text, reply_to_message_id=message.message_id)
-    else:
-        bot.send_message(message.chat.id, text)
-
-
-# =========================================================
-# BOTNI ISHGA TUSHIRISH
-# =========================================================
 
 if __name__ == "__main__":
-    logger.info("APEX ishga tushmoqda...")
-    try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=30)
-    except KeyboardInterrupt:
-        logger.info("Bot to'xtatildi.")
-    except Exception:
-        logger.exception("BOT CRITICAL ERROR")
+    main()
